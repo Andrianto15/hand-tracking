@@ -3,6 +3,7 @@ import mediapipe as mp
 import time
 import os
 import sys
+from datetime import datetime
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 
@@ -29,6 +30,83 @@ FINGER_TIPS = {
     16: "Ring",
     20: "Pinky"
 }
+
+def detect_finger_states(landmarks, handedness):
+    """Mendeteksi status terangkat (True/False) untuk setiap jari."""
+    # Helper untuk menghitung jarak Euclidean 2D (lebih stabil daripada 3D karena tidak ada noise depth)
+    def get_dist_2d(p1, p2):
+        return ((p1.x - p2.x)**2 + (p1.y - p2.y)**2)**0.5
+        
+    # Jari telunjuk (8 vs 6), tengah (12 vs 10), manis (16 vs 14), kelingking (20 vs 18)
+    # y semakin kecil berarti posisi vertikal semakin tinggi (ke atas layar)
+    index_raised = landmarks[8].y < landmarks[6].y
+    middle_raised = landmarks[12].y < landmarks[10].y
+    ring_raised = landmarks[16].y < landmarks[14].y
+    pinky_raised = landmarks[20].y < landmarks[18].y
+    
+    # Ibu jari (Thumb): menggunakan rasio jarak 2D tip ke wrist vs mcp ke wrist
+    tip = landmarks[4]
+    mcp = landmarks[2]
+    wrist = landmarks[0]
+    dist_tip_wrist = get_dist_2d(tip, wrist)
+    dist_mcp_wrist = get_dist_2d(mcp, wrist)
+    
+    if dist_mcp_wrist > 0:
+        ratio = dist_tip_wrist / dist_mcp_wrist
+    else:
+        ratio = 0.0
+        
+    # Threshold default 1.3 (menggunakan 2D distance ini jauh lebih stabil)
+    thumb_raised = ratio > 1.3
+    
+    return {
+        "thumb": thumb_raised,
+        "index": index_raised,
+        "middle": middle_raised,
+        "ring": ring_raised,
+        "pinky": pinky_raised
+    }, ratio
+
+def classify_gesture(finger_states):
+    """Mengklasifikasikan gesture berdasarkan status jari."""
+    thumb = finger_states["thumb"]
+    index = finger_states["index"]
+    middle = finger_states["middle"]
+    ring = finger_states["ring"]
+    pinky = finger_states["pinky"]
+    
+    # 1. Semua 5 jari True -> "Open Palm"
+    if thumb and index and middle and ring and pinky:
+        return "Open Palm"
+        
+    # 2. Semua 5 jari False -> "Fist"
+    if not (thumb or index or middle or ring or pinky):
+        return "Fist"
+        
+    # 3. Hanya thumb=True, sisanya False -> "Thumbs Up"
+    if thumb and not (index or middle or ring or pinky):
+        return "Thumbs Up"
+        
+    # 4. index=True, middle=True, sisanya False -> "Peace"
+    if index and middle and not (thumb or ring or pinky):
+        return "Peace"
+        
+    # 5. Fallback: Hitung jumlah jari yang True -> "{n} Fingers"
+    n = sum([thumb, index, middle, ring, pinky])
+    return f"{n} Fingers"
+
+def update_gesture_state(state, raw_gesture, debounce_frames=10):
+    """Memperbarui state gesture dengan mekanisme debouncing."""
+    if raw_gesture == state["candidate_gesture"]:
+        state["candidate_count"] += 1
+    else:
+        state["candidate_gesture"] = raw_gesture
+        state["candidate_count"] = 1
+        
+    if state["candidate_count"] >= debounce_frames and state["candidate_gesture"] != state["current_gesture"]:
+        state["current_gesture"] = state["candidate_gesture"]
+        return True
+    return False
 
 def draw_transparent_rect(img, pt1, pt2, color, alpha):
     """Menggambar rectangle transparan (glassmorphic) untuk UI premium."""
@@ -72,7 +150,7 @@ def draw_landmarks_and_bones(frame, hand_landmarks, show_coords):
             cv2.putText(frame, coord_text, (cx + 8, cy + 4), cv2.FONT_HERSHEY_SIMPLEX, 
                         0.3, (200, 200, 200), 1, cv2.LINE_AA)
 
-def draw_info_overlay(frame, fps, show_info, handedness_list, hand_landmarks_list):
+def draw_info_overlay(frame, fps, show_info, handedness_list, hand_landmarks_list, gesture_states):
     """Menggambar UI Panel di pojok kiri atas dan label Left/Right/Fingers."""
     h, w, _ = frame.shape
     help_text = "Press 'i' to toggle info | 'q' to quit"
@@ -101,7 +179,11 @@ def draw_info_overlay(frame, fps, show_info, handedness_list, hand_landmarks_lis
             
             # Left/Right Label (Warna: Hijau untuk Right, Merah untuk Left)
             color = (100, 255, 100) if label == "Right" else (100, 100, 255)
-            cv2.putText(frame, f"Hand {i+1}: {label}", (20, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+            gesture = gesture_states[label]["current_gesture"] if label in gesture_states else None
+            ratio = gesture_states[label]["thumb_ratio"] if (label in gesture_states and "thumb_ratio" in gesture_states[label]) else 0.0
+            gesture_text = f" ({gesture}, T:{ratio:.2f})" if gesture else f" (None, T:{ratio:.2f})"
+            
+            cv2.putText(frame, f"Hand {i+1}: {label}{gesture_text}", (20, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
             y_offset += 25
             
         cv2.putText(frame, help_text, (20, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (180, 180, 180), 1, cv2.LINE_AA)
@@ -127,6 +209,15 @@ def draw_info_overlay(frame, fps, show_info, handedness_list, hand_landmarks_lis
                         0.6, (0, 0, 0), 3, cv2.LINE_AA)
             cv2.putText(frame, label.upper(), (cx - 20, cy + 25), cv2.FONT_HERSHEY_SIMPLEX, 
                         0.6, color, 1, cv2.LINE_AA)
+            
+            # Draw gesture dan thumb ratio di bawah label Left/Right
+            gesture = gesture_states[label]["current_gesture"] if label in gesture_states else None
+            ratio = gesture_states[label]["thumb_ratio"] if (label in gesture_states and "thumb_ratio" in gesture_states[label]) else 0.0
+            gesture_display = f"{gesture if gesture else 'None'} (T:{ratio:.2f})"
+            cv2.putText(frame, gesture_display, (cx - 20, cy + 45), cv2.FONT_HERSHEY_SIMPLEX, 
+                        0.5, (0, 0, 0), 3, cv2.LINE_AA)
+            cv2.putText(frame, gesture_display, (cx - 20, cy + 45), cv2.FONT_HERSHEY_SIMPLEX, 
+                        0.5, (255, 255, 255), 1, cv2.LINE_AA)
             
             # Draw nama jari di ujung jari
             for idx, name in FINGER_TIPS.items():
@@ -181,6 +272,22 @@ def main():
     prev_time = time.time()
     last_timestamp_ms = -1
     
+    # Gesture state per hand
+    gesture_states = {
+        "Left": {
+            "current_gesture": None,
+            "candidate_gesture": None,
+            "candidate_count": 0,
+            "thumb_ratio": 0.0
+        },
+        "Right": {
+            "current_gesture": None,
+            "candidate_gesture": None,
+            "candidate_count": 0,
+            "thumb_ratio": 0.0
+        }
+    }
+    
     print("\n--- Hand Tracker Berhasil Dijalankan ---")
     print("Tekan 'i' di window video untuk menyalakan/mematikan info overlay.")
     print("Tekan 'q' di window video untuk keluar.\n")
@@ -218,13 +325,48 @@ def main():
             hand_landmarks_list = result.hand_landmarks
             handedness_list = result.handedness
             
+            # Track detected hands in this frame to reset the other hand if it is not present
+            detected_hands = set()
+            
+            for i, hand_landmarks in enumerate(hand_landmarks_list):
+                if handedness_list and i < len(handedness_list):
+                    # Koreksi label karena kamera dimirror (flip horizontal)
+                    raw_label = handedness_list[i][0].category_name
+                    hand_label = "Left" if raw_label == "Right" else "Right"
+                    detected_hands.add(hand_label)
+                    
+                    # Step 1: Detect finger states and get ratio
+                    finger_states, thumb_ratio = detect_finger_states(hand_landmarks, hand_label)
+                    gesture_states[hand_label]["thumb_ratio"] = thumb_ratio
+                    
+                    # Step 2: Classify raw gesture
+                    raw_gesture = classify_gesture(finger_states)
+                    
+                    # Step 4: Update gesture state (debounce)
+                    state_changed = update_gesture_state(gesture_states[hand_label], raw_gesture)
+                    
+                    # Step 5: Logging
+                    if state_changed:
+                        timestamp = datetime.now().strftime("%H:%M:%S")
+                        print(f"[{timestamp}] {hand_label} Hand: {gesture_states[hand_label]['current_gesture']}")
+            
+            # Reset state for undetected hands
+            for hand_label in ["Left", "Right"]:
+                if hand_label not in detected_hands:
+                    gesture_states[hand_label] = {
+                        "current_gesture": None,
+                        "candidate_gesture": None,
+                        "candidate_count": 0,
+                        "thumb_ratio": 0.0
+                    }
+            
             # 1. Gambar skeleton & landmarks
             for hand_landmarks in hand_landmarks_list:
                 # Koordinat detil digambar nempel di sendi hanya jika show_info = True
                 draw_landmarks_and_bones(frame, hand_landmarks, show_coords=show_info)
                 
             # 2. Gambar overlay info & status panel
-            draw_info_overlay(frame, fps, show_info, handedness_list, hand_landmarks_list)
+            draw_info_overlay(frame, fps, show_info, handedness_list, hand_landmarks_list, gesture_states)
             
             # Tampilkan frame
             cv2.imshow("Hand Tracking Experiment", frame)
